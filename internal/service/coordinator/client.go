@@ -40,6 +40,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 )
 
@@ -143,8 +144,9 @@ type clientImpl struct {
 	config   *Config
 	registry serviceregistry.ServiceRegistry
 
-	clientsMu sync.RWMutex
-	clients   map[string]*client // Cache of gRPC clients by coordinator ID
+	clientsMu      sync.RWMutex
+	clients        map[string]*client // Cache of gRPC clients by coordinator ID
+	retiredClients map[*client]struct{}
 
 	ownerRoutesMu sync.RWMutex
 	ownerRoutes   map[string]serviceregistry.HostInfo
@@ -164,13 +166,73 @@ type pinnedStateCoordinator struct {
 }
 
 // client holds the gRPC connection and clients for one coordinator endpoint.
-// The connection is closed when the endpoint is replaced or during cleanup.
+// Failed health/heartbeat connections are retired from the cache and closed
+// after existing RPCs finish; cleanup closes all connections.
 type client struct {
 	address      string
 	startedAt    time.Time
 	conn         *grpc.ClientConn
 	client       coordinatorv1.CoordinatorServiceClient
 	healthClient grpc_health_v1.HealthClient
+
+	rpcMu      sync.Mutex
+	activeRPCs int
+	retired    bool
+	drainOnce  sync.Once
+	onDrained  func()
+}
+
+// Retired connections finish existing RPCs (including log streams) before closing.
+func (c *client) retire() {
+	c.rpcMu.Lock()
+	c.retired = true
+	drained := c.activeRPCs == 0
+	c.rpcMu.Unlock()
+	if drained {
+		c.drainOnce.Do(func() { go c.onDrained() })
+	}
+}
+
+func (c *client) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context { return ctx }
+func (c *client) HandleRPC(_ context.Context, event stats.RPCStats) {
+	c.rpcMu.Lock()
+	switch event.(type) {
+	case *stats.Begin:
+		c.activeRPCs++
+	case *stats.End:
+		c.activeRPCs--
+	default:
+		c.rpcMu.Unlock()
+		return
+	}
+	drained := c.retired && c.activeRPCs == 0
+	c.rpcMu.Unlock()
+	if drained {
+		c.drainOnce.Do(func() { go c.onDrained() })
+	}
+}
+func (c *client) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context { return ctx }
+func (c *client) HandleConn(context.Context, stats.ConnStats)                       {}
+
+// Evict only the client that failed, never a concurrently created replacement.
+func (cli *clientImpl) retireFailedClient(member serviceregistry.HostInfo, failed *client, err error) {
+	code := status.Code(err)
+	if code != codes.DeadlineExceeded && code != codes.Unavailable {
+		return
+	}
+	cli.clientsMu.Lock()
+	key := coordinatorMemberKey(member)
+	if cli.clients[key] != failed {
+		cli.clientsMu.Unlock()
+		return
+	}
+	delete(cli.clients, key)
+	if cli.retiredClients == nil {
+		cli.retiredClients = make(map[*client]struct{})
+	}
+	cli.retiredClients[failed] = struct{}{}
+	cli.clientsMu.Unlock()
+	failed.retire()
 }
 
 type ownerLogStream struct {
@@ -439,6 +501,7 @@ func (cli *clientImpl) attemptCall(ctx context.Context, members []serviceregistr
 
 		// Check if the coordinator is healthy
 		if err := cli.isHealthy(ctx, client); err != nil {
+			cli.retireFailedClient(member, client, err)
 			logger.Warn(ctx, "Failed to check coordinator health",
 				slog.String("coordinator-id", member.ID),
 				tag.Host(member.Host),
@@ -675,6 +738,9 @@ func (cli *clientImpl) callOwner(
 		if err == nil && checkHealth {
 			err = cli.isHealthy(callCtx, memberClient)
 			healthFailed = err != nil
+			if healthFailed {
+				cli.retireFailedClient(member, memberClient, err)
+			}
 		}
 		if err == nil {
 			callbackCtx := callCtx
@@ -949,32 +1015,43 @@ func (cli *clientImpl) createClient(member serviceregistry.HostInfo) (*client, e
 	address := coordinatorAddress(member)
 
 	// Create gRPC connection
+	c := &client{address: address}
+	c.onDrained = func() {
+		cli.clientsMu.Lock()
+		delete(cli.retiredClients, c)
+		cli.clientsMu.Unlock()
+		_ = c.conn.Close()
+	}
+	dialOpts = append(dialOpts, grpc.WithStatsHandler(c))
 	conn, err := grpc.NewClient(address, dialOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create coordinator client for %s: %w", address, err)
 	}
 
-	return &client{
-		address:      address,
-		conn:         conn,
-		client:       coordinatorv1.NewCoordinatorServiceClient(conn),
-		healthClient: grpc_health_v1.NewHealthClient(conn),
-	}, nil
+	c.conn = conn
+	c.client = coordinatorv1.NewCoordinatorServiceClient(conn)
+	c.healthClient = grpc_health_v1.NewHealthClient(conn)
+	return c, nil
 }
 
 // Cleanup cleans up all connections
 func (cli *clientImpl) Cleanup(ctx context.Context) error {
 	cli.clientsMu.Lock()
-	defer cli.clientsMu.Unlock()
-
-	for id, c := range cli.clients {
+	connections := make([]*client, 0, len(cli.clients)+len(cli.retiredClients))
+	for _, c := range cli.clients {
+		connections = append(connections, c)
+	}
+	for c := range cli.retiredClients {
+		connections = append(connections, c)
+	}
+	cli.clients = make(map[string]*client)
+	cli.retiredClients = nil
+	cli.clientsMu.Unlock()
+	for _, c := range connections {
 		if err := c.conn.Close(); err != nil {
-			logger.Error(ctx, "Failed to close connection", slog.String("coordinator-id", id), tag.Error(err))
+			logger.Error(ctx, "Failed to close connection", slog.String("coordinator-address", c.address), tag.Error(err))
 		}
 	}
-
-	// Clear the map
-	cli.clients = make(map[string]*client)
 	return nil
 }
 
@@ -1179,8 +1256,9 @@ func (cli *clientImpl) Heartbeat(ctx context.Context, req *coordinatorv1.Heartbe
 	}
 
 	var resp *coordinatorv1.HeartbeatResponse
-	call := func(ctx context.Context, _ serviceregistry.HostInfo, client *client) error {
+	call := func(ctx context.Context, member serviceregistry.HostInfo, client *client) error {
 		callResp, callErr := client.client.Heartbeat(ctx, req)
+		cli.retireFailedClient(member, client, callErr)
 		if callErr != nil {
 			return fmt.Errorf("heartbeat failed: %w", callErr)
 		}
@@ -1284,9 +1362,10 @@ func (cli *clientImpl) CompleteAgentSessionCleanupTo(
 
 func (cli *clientImpl) RunHeartbeatTo(ctx context.Context, owner serviceregistry.HostInfo, req *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
 	var resp *coordinatorv1.RunHeartbeatResponse
-	err := cli.callOwner(ctx, owner, false, func(ctx context.Context, _ serviceregistry.HostInfo, client *client) error {
+	err := cli.callOwner(ctx, owner, false, func(ctx context.Context, member serviceregistry.HostInfo, client *client) error {
 		var callErr error
 		resp, callErr = client.client.RunHeartbeat(ctx, req)
+		cli.retireFailedClient(member, client, callErr)
 		if callErr != nil {
 			return fmt.Errorf("run heartbeat failed: %w", callErr)
 		}
@@ -1390,6 +1469,7 @@ func openStreamWithFailover[T any](
 			continue
 		}
 		if err := cli.isHealthy(ctx, memberClient); err != nil {
+			cli.retireFailedClient(member, memberClient, err)
 			cli.recordFailure(err)
 			lastErr = err
 			continue
@@ -1586,6 +1666,7 @@ func (cli *clientImpl) putWorkspaceBundle(
 			continue
 		}
 		if err := cli.isHealthy(ctx, memberClient); err != nil {
+			cli.retireFailedClient(member, memberClient, err)
 			errs = append(errs, fmt.Errorf("coordinator %q is unhealthy: %w", member.ID, err))
 			continue
 		}

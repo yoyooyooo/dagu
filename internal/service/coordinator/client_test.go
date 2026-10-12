@@ -36,7 +36,9 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"sync"
 )
 
 func parseHostPort(addr string) (string, int) {
@@ -1837,6 +1839,59 @@ func TestClientHeartbeatFailsOverAfterHealthCheckStalls(t *testing.T) {
 	assert.Equal(t, int32(1), heartbeatCalls.Load())
 }
 
+// A stalled connection stays unhealthy; only a new TCP connection can recover.
+func TestClientHealthCheckDeadlineReconnectsNextCall(t *testing.T) {
+	t.Parallel()
+	config := coordinator.DefaultConfig()
+	config.HeartbeatTimeout = 200 * time.Millisecond
+	var mu sync.Mutex
+	var failedPeer, heartbeatPeer string
+	var checks int
+	healthServer := health.NewServer()
+	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	server, addr := startMockServerWithHealth(t, &mockCoordinatorService{
+		heartbeatFunc: func(ctx context.Context, _ *coordinatorv1.HeartbeatRequest) (*coordinatorv1.HeartbeatResponse, error) {
+			p, _ := peer.FromContext(ctx)
+			mu.Lock()
+			heartbeatPeer = p.Addr.String()
+			mu.Unlock()
+			return &coordinatorv1.HeartbeatResponse{}, nil
+		},
+	}, healthServer, grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if info.FullMethod == grpc_health_v1.Health_Check_FullMethodName {
+			p, _ := peer.FromContext(ctx)
+			mu.Lock()
+			checks++
+			if failedPeer == "" {
+				failedPeer = p.Addr.String()
+			}
+			stalled := failedPeer == p.Addr.String()
+			mu.Unlock()
+			if stalled {
+				<-ctx.Done()
+				return nil, status.Error(codes.DeadlineExceeded, "stalled connection")
+			}
+		}
+		return handler(ctx, req)
+	}))
+	defer server.Stop()
+	host, port := parseHostPort(addr)
+	client := coordinator.New(&mockServiceMonitor{members: []serviceregistry.HostInfo{
+		{ID: "coord-a", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive},
+	}}, config)
+	t.Cleanup(func() { require.NoError(t, client.Cleanup(context.Background())) })
+	_, err := client.Heartbeat(t.Context(), &coordinatorv1.HeartbeatRequest{WorkerId: "test-worker"})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	resp, err := client.Heartbeat(t.Context(), &coordinatorv1.HeartbeatRequest{WorkerId: "test-worker"})
+	require.NoError(t, err, "the next heartbeat must use a fresh connection")
+	require.NotNil(t, resp)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 2, checks)
+	require.NotEmpty(t, heartbeatPeer)
+	require.NotEqual(t, failedPeer, heartbeatPeer)
+}
+
 func TestClientRPCFailuresPreserveActiveLogStream(t *testing.T) {
 	t.Parallel()
 
@@ -2392,6 +2447,7 @@ type mockCoordinatorService struct {
 	pollFunc               func(context.Context, *coordinatorv1.PollRequest) (*coordinatorv1.PollResponse, error)
 	ackTaskClaimFunc       func(context.Context, *coordinatorv1.AckTaskClaimRequest) (*coordinatorv1.AckTaskClaimResponse, error)
 	getWorkersFunc         func(context.Context, *coordinatorv1.GetWorkersRequest) (*coordinatorv1.GetWorkersResponse, error)
+	runHeartbeatFunc       func(context.Context, *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error)
 	heartbeatFunc          func(context.Context, *coordinatorv1.HeartbeatRequest) (*coordinatorv1.HeartbeatResponse, error)
 	reportStatusFunc       func(context.Context, *coordinatorv1.ReportStatusRequest) (*coordinatorv1.ReportStatusResponse, error)
 	getRunStatusFunc       func(context.Context, *coordinatorv1.GetDAGRunStatusRequest) (*coordinatorv1.GetDAGRunStatusResponse, error)
@@ -2441,6 +2497,13 @@ func (m *mockCoordinatorService) AckTaskClaim(ctx context.Context, req *coordina
 func (m *mockCoordinatorService) GetWorkers(ctx context.Context, req *coordinatorv1.GetWorkersRequest) (*coordinatorv1.GetWorkersResponse, error) {
 	if m.getWorkersFunc != nil {
 		return m.getWorkersFunc(ctx, req)
+	}
+	return nil, status.Error(codes.Unimplemented, "not implemented")
+}
+
+func (m *mockCoordinatorService) RunHeartbeat(ctx context.Context, req *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
+	if m.runHeartbeatFunc != nil {
+		return m.runHeartbeatFunc(ctx, req)
 	}
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
@@ -2553,4 +2616,136 @@ func startMockTLSServer(t *testing.T, service coordinatorv1.CoordinatorServiceSe
 	healthServer := health.NewServer()
 	healthServer.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	return startMockServerWithHealth(t, service, healthServer, grpc.Creds(creds))
+}
+
+func TestClientHeartbeatFailureDoesNotCloseOpenLogStream(t *testing.T) {
+	for _, code := range []codes.Code{codes.Internal, codes.DeadlineExceeded, codes.Unavailable} {
+		t.Run(code.String(), func(t *testing.T) { testClientFailurePreservesLogStream(t, "heartbeat", code) })
+	}
+}
+
+func TestClientHealthCheckFailureDoesNotCloseOpenLogStream(t *testing.T) {
+	for _, code := range []codes.Code{codes.Internal, codes.DeadlineExceeded, codes.Unavailable} {
+		t.Run(code.String(), func(t *testing.T) { testClientFailurePreservesLogStream(t, "health", code) })
+	}
+}
+
+func TestClientCallOwnerFailureDoesNotCloseOpenLogStream(t *testing.T) {
+	testClientFailurePreservesLogStream(t, "owner", codes.Unavailable)
+}
+
+func testClientFailurePreservesLogStream(t *testing.T, operation string, code codes.Code) {
+	t.Helper()
+	t.Parallel()
+	var failHealth atomic.Bool
+	received := make(chan string, 2)
+	hs := health.NewServer()
+	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	server, addr := startMockServerWithHealth(t, &mockCoordinatorService{
+		heartbeatFunc: func(context.Context, *coordinatorv1.HeartbeatRequest) (*coordinatorv1.HeartbeatResponse, error) {
+			return nil, status.Error(code, "heartbeat failure")
+		},
+		reportStatusFunc: func(context.Context, *coordinatorv1.ReportStatusRequest) (*coordinatorv1.ReportStatusResponse, error) {
+			return nil, status.Error(codes.Unavailable, "ordinary owner RPC failure")
+		},
+		streamLogsFunc: func(stream coordinatorv1.CoordinatorService_StreamLogsServer) error {
+			for {
+				chunk, err := stream.Recv()
+				if err == io.EOF {
+					return stream.SendAndClose(&coordinatorv1.StreamLogsResponse{})
+				}
+				if err != nil {
+					return err
+				}
+				received <- string(chunk.Data)
+			}
+		},
+	}, hs, grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if info.FullMethod == grpc_health_v1.Health_Check_FullMethodName && failHealth.Load() {
+			return nil, status.Error(code, "health check failure")
+		}
+		return handler(ctx, req)
+	}))
+	defer server.Stop()
+	host, port := parseHostPort(addr)
+	owner := serviceregistry.HostInfo{ID: "owner", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive}
+	client := coordinator.New(&mockServiceMonitor{members: []serviceregistry.HostInfo{owner}}, coordinator.DefaultConfig())
+	t.Cleanup(func() { require.NoError(t, client.Cleanup(context.Background())) })
+	stream, err := client.StreamLogsTo(t.Context(), owner)
+	require.NoError(t, err)
+	send := func(data string) {
+		require.NoError(t, stream.Send(&coordinatorv1.LogChunk{Data: []byte(data)}))
+		select {
+		case got := <-received:
+			require.Equal(t, data, got)
+		case <-time.After(time.Second):
+			t.Fatal("log stream interrupted")
+		}
+	}
+	send("before")
+	switch operation {
+	case "heartbeat":
+		_, err = client.Heartbeat(t.Context(), &coordinatorv1.HeartbeatRequest{})
+	case "health":
+		failHealth.Store(true)
+		_, err = client.Heartbeat(t.Context(), &coordinatorv1.HeartbeatRequest{})
+	case "owner":
+		_, err = client.ReportStatusTo(t.Context(), owner, &coordinatorv1.ReportStatusRequest{})
+	}
+	require.Error(t, err)
+	send("after")
+	_, err = stream.CloseAndRecv()
+	require.NoError(t, err)
+}
+
+func TestClientHeartbeatReconnects(t *testing.T) {
+	for _, runHeartbeat := range []bool{false, true} {
+		for _, code := range []codes.Code{codes.DeadlineExceeded, codes.Unavailable} {
+			t.Run(fmt.Sprintf("run=%t/%s", runHeartbeat, code), func(t *testing.T) {
+				t.Parallel()
+				var mu sync.Mutex
+				var failedPeer, recoveredPeer string
+				checkPeer := func(ctx context.Context) error {
+					p, _ := peer.FromContext(ctx)
+					mu.Lock()
+					defer mu.Unlock()
+					if failedPeer == "" {
+						failedPeer = p.Addr.String()
+					}
+					if failedPeer == p.Addr.String() {
+						return status.Error(code, "dead heartbeat connection")
+					}
+					recoveredPeer = p.Addr.String()
+					return nil
+				}
+				server, addr := startMockServer(t, &mockCoordinatorService{
+					heartbeatFunc: func(ctx context.Context, _ *coordinatorv1.HeartbeatRequest) (*coordinatorv1.HeartbeatResponse, error) {
+						return &coordinatorv1.HeartbeatResponse{}, checkPeer(ctx)
+					},
+					runHeartbeatFunc: func(ctx context.Context, _ *coordinatorv1.RunHeartbeatRequest) (*coordinatorv1.RunHeartbeatResponse, error) {
+						return &coordinatorv1.RunHeartbeatResponse{}, checkPeer(ctx)
+					},
+				})
+				defer server.Stop()
+				host, port := parseHostPort(addr)
+				owner := serviceregistry.HostInfo{ID: "owner", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive}
+				client := coordinator.New(&mockServiceMonitor{members: []serviceregistry.HostInfo{owner}}, coordinator.DefaultConfig())
+				t.Cleanup(func() { require.NoError(t, client.Cleanup(context.Background())) })
+				call := func() error {
+					if runHeartbeat {
+						_, err := client.RunHeartbeatTo(t.Context(), owner, &coordinatorv1.RunHeartbeatRequest{})
+						return err
+					}
+					_, err := client.Heartbeat(t.Context(), &coordinatorv1.HeartbeatRequest{})
+					return err
+				}
+				require.Equal(t, code, status.Code(call()))
+				require.NoError(t, call())
+				mu.Lock()
+				defer mu.Unlock()
+				require.NotEmpty(t, recoveredPeer)
+				require.NotEqual(t, failedPeer, recoveredPeer)
+			})
+		}
+	}
 }
