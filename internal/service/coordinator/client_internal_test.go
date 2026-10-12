@@ -5,6 +5,7 @@ package coordinator
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"testing"
 	"time"
@@ -12,6 +13,10 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/serviceregistry"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/stats"
+	"google.golang.org/grpc/status"
 )
 
 type stubServiceRegistry struct{}
@@ -133,4 +138,77 @@ func TestClientCacheUsesAdvertisedEndpointAcrossCoordinatorProcesses(t *testing.
 	require.Same(t, first, second)
 	require.Len(t, cli.clients, 1)
 	require.NoError(t, cli.Cleanup(t.Context()))
+}
+
+func TestClientRetiresOnlyFailedConnection(t *testing.T) {
+	t.Parallel()
+	cli := New(stubServiceRegistry{}, DefaultConfig()).(*clientImpl)
+	t.Cleanup(func() { require.NoError(t, cli.Cleanup(context.Background())) })
+	owner := serviceregistry.HostInfo{Host: "127.0.0.1", Port: 1234}
+	other := serviceregistry.HostInfo{Host: "127.0.0.1", Port: 5678}
+	failed, err := cli.getOrCreateClient(owner)
+	require.NoError(t, err)
+	healthy, err := cli.getOrCreateClient(other)
+	require.NoError(t, err)
+	cli.retireFailedClient(owner, failed, status.Error(codes.Internal, "application failure"))
+	same, err := cli.getOrCreateClient(owner)
+	require.NoError(t, err)
+	require.Same(t, failed, same)
+	cli.retireFailedClient(owner, failed, status.Error(codes.Unavailable, "dead connection"))
+	fresh, err := cli.getOrCreateClient(owner)
+	require.NoError(t, err)
+	require.NotSame(t, failed, fresh)
+	cli.retireFailedClient(owner, failed, status.Error(codes.DeadlineExceeded, "late failure"))
+	same, err = cli.getOrCreateClient(owner)
+	require.NoError(t, err)
+	require.Same(t, fresh, same)
+	same, err = cli.getOrCreateClient(other)
+	require.NoError(t, err)
+	require.Same(t, healthy, same)
+	require.Eventually(t, func() bool { return failed.conn.GetState() == connectivity.Shutdown }, time.Second, time.Millisecond)
+	require.NotEqual(t, connectivity.Shutdown, healthy.conn.GetState())
+}
+
+func TestClientOrdinaryRPCFailureKeepsConnection(t *testing.T) {
+	t.Parallel()
+	cli := New(stubServiceRegistry{}, DefaultConfig()).(*clientImpl)
+	t.Cleanup(func() { require.NoError(t, cli.Cleanup(context.Background())) })
+	member := serviceregistry.HostInfo{Host: "127.0.0.1", Port: 1234}
+	original, err := cli.getOrCreateClient(member)
+	require.NoError(t, err)
+	for _, code := range []codes.Code{codes.Internal, codes.DeadlineExceeded, codes.Unavailable} {
+		err := cli.callOwner(t.Context(), member, false, func(context.Context, serviceregistry.HostInfo, *client) error {
+			return status.Error(code, "ordinary RPC failed")
+		})
+		require.Equal(t, code, status.Code(err))
+		cached, err := cli.getOrCreateClient(member)
+		require.NoError(t, err)
+		require.Same(t, original, cached)
+		require.NotEqual(t, connectivity.Shutdown, original.conn.GetState())
+	}
+}
+
+func TestClientRetiredConnectionDrains(t *testing.T) {
+	for _, cleanup := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cleanup=%t", cleanup), func(t *testing.T) {
+			t.Parallel()
+			cli := New(stubServiceRegistry{}, DefaultConfig()).(*clientImpl)
+			t.Cleanup(func() { require.NoError(t, cli.Cleanup(context.Background())) })
+			member := serviceregistry.HostInfo{Host: "127.0.0.1", Port: 1234}
+			c, err := cli.getOrCreateClient(member)
+			require.NoError(t, err)
+			c.HandleRPC(t.Context(), &stats.Begin{})
+			cli.retireFailedClient(member, c, status.Error(codes.DeadlineExceeded, "health timeout"))
+			require.NotEqual(t, connectivity.Shutdown, c.conn.GetState())
+			if cleanup {
+				require.NoError(t, cli.Cleanup(t.Context()))
+			} else {
+				c.HandleRPC(t.Context(), &stats.End{})
+			}
+			require.Eventually(t, func() bool { return c.conn.GetState() == connectivity.Shutdown }, time.Second, time.Millisecond)
+			cli.clientsMu.RLock()
+			require.Empty(t, cli.retiredClients)
+			cli.clientsMu.RUnlock()
+		})
+	}
 }
